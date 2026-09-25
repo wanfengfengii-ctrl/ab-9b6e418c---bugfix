@@ -16,12 +16,18 @@ dynamic program over peak bitmasks explores the complete search space, and
 ties on all three objectives are detected by enumerating a second optimal
 witness.  All arithmetic is done with :class:`decimal.Decimal`, so results
 are exact and reproducible.
+
+Decimal operators round to the precision of the active thread-local context
+(28 significant digits by default), which would silently truncate submitted
+values carrying more digits than that.  All arithmetic below therefore runs
+inside :func:`exact_decimal_context`, whose precision is derived from the
+inputs so that no intermediate result can ever be rounded.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from decimal import Decimal
+from decimal import Context, Decimal, localcontext
 from typing import Iterable, Sequence
 
 #: Exact isotope spacing (mass difference of 13C vs 12C) in Dalton.
@@ -46,6 +52,47 @@ class SearchSpaceExceededError(RuntimeError):
     """The exact search exceeded the configured work budget."""
 
 
+#: Guard digits added on top of the provably sufficient working precision.
+_GUARD_DIGITS = 20
+
+
+def _decimal_positions(value: Decimal) -> int:
+    """Digit positions (integer + fractional) spanned by ``value``.
+
+    An exact sum, difference, or product of decimals never needs more
+    significant digits than the positions bound derived from these spans,
+    which makes them a safe basis for a rounding-free working precision.
+    """
+    exponent = value.as_tuple().exponent
+    fractional = -exponent if exponent < 0 else 0
+    if value.is_zero():
+        return max(fractional, 1)
+    return max(value.adjusted() + 1, 0) + fractional
+
+
+def exact_decimal_context(
+    mzs: Iterable[Decimal],
+    charges: Iterable[int],
+    *values: Decimal,
+) -> Context:
+    """Return a context under which all solver arithmetic stays exact.
+
+    ``mzs`` and ``values`` are the decimals the computation draws on (peak
+    m/z, tolerances); ``charges`` are the charge states values may be
+    multiplied by.  Every intermediate the solver forms -- a spacing
+    difference, a product with a charge state, a neutral-mass window bound --
+    spans at most ``max positions + charge digits + 2`` digit positions
+    (a difference adds at most one position, a product by a charge at most
+    the charge's digit count), so the precision returned here, with guard
+    digits on top, can never round an intermediate.
+    """
+    positions = [_decimal_positions(ISOTOPE_SPACING)]
+    positions.extend(_decimal_positions(mz) for mz in mzs)
+    positions.extend(_decimal_positions(value) for value in values)
+    charge_digits = max((len(str(charge)) for charge in charges), default=1)
+    return Context(prec=max(positions) + charge_digits + _GUARD_DIGITS)
+
+
 def generate_clusters_for_charge(
     charge: int,
     mzs: Sequence[Decimal],
@@ -58,17 +105,21 @@ def generate_clusters_for_charge(
     is equivalent to ``|Δmz − 1.003355/z| ≤ tol`` but needs no division.
     """
     n = len(mzs)
-    threshold = tolerance * charge
-    # adjacency[i] = peaks j > i whose spacing from i matches 1.003355/z.
-    adjacency: list[list[int]] = [[] for _ in range(n)]
-    for i in range(n):
-        for j in range(i + 1, n):
-            delta = mzs[j] - mzs[i]
-            deviation = delta * charge - ISOTOPE_SPACING
-            if deviation > threshold:
-                break  # m/z strictly increasing: later j deviate even more
-            if deviation >= -threshold:
-                adjacency[i].append(j)
+    # Decimal operators round to the active context's precision (28 digits
+    # by default); evaluate the spacing test under a working precision that
+    # keeps the submitted decimals and every intermediate exact.
+    with localcontext(exact_decimal_context(mzs, (charge,), tolerance)):
+        threshold = tolerance * charge
+        # adjacency[i] = peaks j > i whose spacing from i matches 1.003355/z.
+        adjacency: list[list[int]] = [[] for _ in range(n)]
+        for i in range(n):
+            for j in range(i + 1, n):
+                delta = mzs[j] - mzs[i]
+                deviation = delta * charge - ISOTOPE_SPACING
+                if deviation > threshold:
+                    break  # m/z strictly increasing: later j deviate even more
+                if deviation >= -threshold:
+                    adjacency[i].append(j)
     # A cluster is a chain i1 < i2 < ... < ik (2 <= k <= 6) of
     # adjacent matches; extend chains depth-first.
     found: list[Cluster] = []
@@ -391,6 +442,11 @@ class CoelutingSolver:
         self._required = required  # ascending distinct positive ints
         mzs = [p.mz for p in peaks]
         intensities = [p.intensity for p in peaks]
+        # Working precision under which the neutral-mass window arithmetic in
+        # solve() stays exact for these inputs (see exact_decimal_context).
+        self._context = exact_decimal_context(
+            mzs, required, tolerance, mass_tolerance
+        )
         options: list[list[Cluster]] = []
         for z in required:
             bucket = generate_clusters_for_charge(z, mzs, intensities, tolerance)
@@ -511,6 +567,12 @@ class CoelutingSolver:
                 return
 
     def solve(self) -> CoelutingResult:
+        # The mass-window intersections and neutral-mass bounds are decimal
+        # arithmetic: run them under the exact working precision.
+        with localcontext(self._context):
+            return self._solve()
+
+    def _solve(self) -> CoelutingResult:
         total_intensity = sum(self._intensities)
         best: list[tuple[int, int]] = [(-1, -1)]
         self._find_best(

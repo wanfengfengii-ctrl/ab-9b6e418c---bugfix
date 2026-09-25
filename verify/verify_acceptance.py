@@ -363,6 +363,43 @@ def scenario_full_scale(client: httpx.Client) -> None:
     )
 
 
+def scenario_high_precision_spacing(client: httpx.Client) -> None:
+    print("[high-precision m/z, zero tolerance]")
+    # 31-significant-digit m/z values: more digits than the default decimal
+    # context precision (28), so rounded arithmetic would erase the 1e-30
+    # excess over the isotope spacing and invent a cluster.
+    base = {"charges": [1], "tolerance": "0"}
+    exact = {
+        **base,
+        "peaks": [
+            {"mz": "0.000000000000000000000000000001", "intensity": 10},
+            {"mz": "1.003355000000000000000000000001", "intensity": 10},
+        ],
+    }
+    resp = post(client, exact)
+    body = resp.json()
+    check(
+        "high-precision: pair exactly 1.003355 apart is a cluster at zero tolerance",
+        resp.status_code == 200
+        and body.get("verdict") == "UNIQUE"
+        and [c.get("peak_indices") for c in body.get("clusters", [])] == [[0, 1]],
+        resp.text[:300],
+    )
+    off = {
+        **base,
+        "peaks": [
+            {"mz": "0.000000000000000000000000000001", "intensity": 10},
+            {"mz": "1.003355000000000000000000000002", "intensity": 10},
+        ],
+    }
+    resp = post(client, off)
+    check(
+        "high-precision: pair 1e-30 past the spacing is not a cluster",
+        resp.status_code == 200 and resp.json().get("verdict") == "UNRESOLVED",
+        resp.text[:300],
+    )
+
+
 def scenario_validation(client: httpx.Client) -> None:
     print("[validation: field-locatable 422, never a verdict]")
     good_peaks = [
@@ -647,6 +684,58 @@ def scenario_coeluting_three_charges(client: httpx.Client) -> None:
     )
 
 
+def scenario_coeluting_high_precision(client: httpx.Client) -> None:
+    print("[coeluting: high-precision zero-tolerance adjudication]")
+    # 31-significant-digit m/z values.  The z=2 pair (0, 2) is exactly
+    # 0.5016775 apart, but the z=1 pair (1, 3) is 1.003355 + 1e-30 apart:
+    # with zero tolerance no charge-1 cluster exists, so no complete
+    # candidate covers both required charges.
+    base = {
+        "peaks": [
+            {"mz": "0.0000000000000000000000000000005", "intensity": 10},
+            {"mz": "0.000000000000000000000000000001", "intensity": 10},
+            {"mz": "0.5016775000000000000000000000005", "intensity": 10},
+            {"mz": "1.003355000000000000000000000002", "intensity": 10},
+        ],
+        "charges": [1, 2],
+        "required_charges": [1, 2],
+        "tolerance": "0",
+        "mass_tolerance": "0",
+    }
+    resp = post_coeluting(client, base)
+    body = resp.json()
+    check(
+        "high-precision: 1e-30 spacing excess is rejected -> UNRESOLVED",
+        resp.status_code == 200
+        and body.get("verdict") == "UNRESOLVED"
+        and body.get("clusters") == []
+        and body.get("common_mass") is None
+        and body.get("second_witness") is None
+        and body.get("objectives", {}).get("explained_peak_count") == 0,
+        resp.text[:300],
+    )
+    # Same envelope with the z=1 spacing exactly 1.003355: a legal joint
+    # candidate whose clusters share the neutral mass 1e-30 Da.
+    exact = {
+        **base,
+        "peaks": base["peaks"][:3]
+        + [{"mz": "1.003355000000000000000000000001", "intensity": 10}],
+    }
+    resp = post_coeluting(client, exact)
+    body = resp.json()
+    common = body.get("common_mass") or {}
+    check(
+        "high-precision: exact spacing at 31 significant digits is UNIQUE",
+        resp.status_code == 200
+        and body.get("verdict") == "UNIQUE"
+        and body.get("objectives", {}).get("explained_peak_count") == 4
+        and sorted(c.get("charge") for c in body.get("clusters", [])) == [1, 2]
+        and Decimal(common.get("lower", "NaN")) == Decimal("1E-30")
+        and Decimal(common.get("upper", "NaN")) == Decimal("1E-30"),
+        resp.text[:300],
+    )
+
+
 def scenario_coeluting_validation(client: httpx.Client) -> None:
     print("[coeluting: validation 422, never a verdict]")
     good = {
@@ -758,6 +847,7 @@ def main() -> int:
         scenario_tolerance_boundary(client)
         scenario_cluster_size_cap(client)
         scenario_full_scale(client)
+        scenario_high_precision_spacing(client)
         scenario_validation(client)
         # Coeluting multi-charge confirmation (new endpoint).
         scenario_coeluting_unique(client)
@@ -766,6 +856,7 @@ def main() -> int:
         scenario_coeluting_overlap_rejected(client)
         scenario_coeluting_ambiguous(client)
         scenario_coeluting_three_charges(client)
+        scenario_coeluting_high_precision(client)
         scenario_coeluting_validation(client)
         # Legacy endpoint regression.
         scenario_legacy_compatibility(client)

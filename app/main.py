@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import os
-from decimal import Decimal
+from decimal import Decimal, localcontext
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
@@ -34,6 +34,7 @@ from .solver import (
     Deconvolver,
     Peak,
     SearchSpaceExceededError,
+    exact_decimal_context,
 )
 
 # Safety valve for pathological search spaces (see app.solver).  The search
@@ -206,14 +207,20 @@ def _build_coeluting_response(
     peaks: list[Peak],
     result: CoelutingResult,
 ) -> CoelutingResponse:
-    primary = _coeluting_solution_out(
-        result.primary, peaks, payload.mass_tolerance
+    # Neutral masses and common-mass bounds are decimal arithmetic; evaluate
+    # them under the same rounding-free working precision as the solver.
+    context = exact_decimal_context(
+        [p.mz for p in peaks], payload.required_charges, payload.mass_tolerance
     )
-    secondary = (
-        _coeluting_solution_out(result.secondary, peaks, payload.mass_tolerance)
-        if result.secondary is not None
-        else None
-    )
+    with localcontext(context):
+        primary = _coeluting_solution_out(
+            result.primary, peaks, payload.mass_tolerance
+        )
+        secondary = (
+            _coeluting_solution_out(result.secondary, peaks, payload.mass_tolerance)
+            if result.secondary is not None
+            else None
+        )
     common_mass = (
         MassIntervalOut(lower=str(result.mass_lower), upper=str(result.mass_upper))
         if result.primary

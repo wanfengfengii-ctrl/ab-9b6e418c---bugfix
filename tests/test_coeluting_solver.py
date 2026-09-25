@@ -184,6 +184,39 @@ def test_witness_cannot_share_peaks():
     assert result.verdict == VERDICT_UNRESOLVED
 
 
+def test_high_precision_zero_tolerance_spacing():
+    # 31-significant-digit m/z values: the z=1 pair is exactly
+    # 1.003355 + 1e-30 apart, which a zero tolerance must reject.  Default
+    # 28-digit decimal arithmetic would round that excess away and accept a
+    # cluster that covers both required charges.
+    spec = [
+        ("0.0000000000000000000000000000005", 10),
+        ("0.000000000000000000000000000001", 10),
+        ("0.5016775000000000000000000000005", 10),
+        ("1.003355000000000000000000000002", 10),
+    ]
+    result = solve(spec, [1, 2], "0", "0")
+    assert result.verdict == VERDICT_UNRESOLVED
+    assert result.primary == ()
+    assert result.secondary is None
+
+
+def test_high_precision_exact_spacing_is_legal():
+    # Same envelope but the z=1 pair is exactly 1.003355 apart: a legal joint
+    # candidate at neutral mass 1e-30 Da.
+    spec = [
+        ("0.0000000000000000000000000000005", 10),
+        ("0.000000000000000000000000000001", 10),
+        ("0.5016775000000000000000000000005", 10),
+        ("1.003355000000000000000000000001", 10),
+    ]
+    result = solve(spec, [1, 2], "0", "0")
+    assert result.verdict == VERDICT_UNIQUE
+    assert (result.explained_intensity, result.explained_peak_count, result.cluster_count) == (40, 4, 2)
+    assert {c.charge for c in result.primary} == {1, 2}
+    assert result.mass_lower == result.mass_upper == Decimal("1E-30")
+
+
 def test_search_budget_guard():
     spec = merge_specs(pair_around("1000", 1), pair_around("1000", 2))
     peaks = make_peaks(spec)

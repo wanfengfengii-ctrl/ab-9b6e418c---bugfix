@@ -247,6 +247,68 @@ def test_invalid_inputs_are_422_with_located_fields():
         ), f"{name}: {locs}"
 
 
+def test_high_precision_zero_tolerance_is_unresolved():
+    # 31-significant-digit m/z values: the z=1 pair spacing is exactly
+    # 1.003355 + 1e-30, which a zero tolerance must reject.  Default 28-digit
+    # decimal arithmetic would round that excess away and invent a cluster.
+    payload = {
+        "peaks": [
+            {"mz": "0.0000000000000000000000000000005", "intensity": 10},
+            {"mz": "0.000000000000000000000000000001", "intensity": 10},
+            {"mz": "0.5016775000000000000000000000005", "intensity": 10},
+            {"mz": "1.003355000000000000000000000002", "intensity": 10},
+        ],
+        "charges": [1, 2],
+        "required_charges": [1, 2],
+        "tolerance": "0",
+        "mass_tolerance": "0",
+    }
+    resp = post(payload)
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["verdict"] == "UNRESOLVED"
+    assert body["objectives"] == {
+        "explained_intensity": 0,
+        "explained_peak_count": 0,
+        "cluster_count": 0,
+    }
+    assert body["clusters"] == []
+    assert body["common_mass"] is None
+    assert body["second_witness"] is None
+
+
+def test_high_precision_exact_spacing_is_unique():
+    # Same envelope but the z=1 pair is exactly 1.003355 apart: a legal joint
+    # candidate at neutral mass 1e-30 Da (z=2 pair 5e-31 + 0.5016775).
+    payload = {
+        "peaks": [
+            {"mz": "0.0000000000000000000000000000005", "intensity": 10},
+            {"mz": "0.000000000000000000000000000001", "intensity": 10},
+            {"mz": "0.5016775000000000000000000000005", "intensity": 10},
+            {"mz": "1.003355000000000000000000000001", "intensity": 10},
+        ],
+        "charges": [1, 2],
+        "required_charges": [1, 2],
+        "tolerance": "0",
+        "mass_tolerance": "0",
+    }
+    resp = post(payload)
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["verdict"] == "UNIQUE"
+    assert body["objectives"] == {
+        "explained_intensity": 40,
+        "explained_peak_count": 4,
+        "cluster_count": 2,
+    }
+    assert sorted(c["charge"] for c in body["clusters"]) == [1, 2]
+    for cluster in body["clusters"]:
+        assert Decimal(cluster["neutral_mass"]) == Decimal("1E-30")
+    common = body["common_mass"]
+    assert Decimal(common["lower"]) == Decimal(common["upper"]) == Decimal("1E-30")
+    assert body["second_witness"] is None
+
+
 def test_legacy_endpoint_semantics_unchanged():
     payload = {
         "peaks": [

@@ -185,6 +185,32 @@ def test_same_peaks_matching_two_charges_are_ambiguous():
     assert charges == {1, 2}
 
 
+def test_high_precision_zero_tolerance_spacing():
+    # 31-significant-digit m/z values exactly 1.003355 apart form a cluster
+    # even at zero tolerance; the arithmetic must not round the inputs to the
+    # default 28-digit context precision.
+    exact = solve(
+        [
+            ("0.000000000000000000000000000001", 10),
+            ("1.003355000000000000000000000001", 10),
+        ],
+        [1],
+        "0",
+    )
+    assert exact.verdict == VERDICT_UNIQUE
+    assert exact.primary[0].peak_indices == (0, 1)
+    # A pair 1e-30 wider than the isotope spacing is not a cluster.
+    off = solve(
+        [
+            ("0.000000000000000000000000000001", 10),
+            ("1.003355000000000000000000000002", 10),
+        ],
+        [1],
+        "0",
+    )
+    assert off.verdict == VERDICT_UNRESOLVED
+
+
 def test_search_budget_guard():
     # A tiny work budget must abort with an explicit error, never a wrong
     # or partial verdict.
