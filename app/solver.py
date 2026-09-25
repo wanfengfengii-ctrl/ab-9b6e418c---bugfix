@@ -20,12 +20,57 @@ are exact and reproducible.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass
-from decimal import Decimal
-from typing import Iterable, Sequence
+from decimal import Decimal, localcontext
+from typing import Any, Iterable, Sequence
 
 #: Exact isotope spacing (mass difference of 13C vs 12C) in Dalton.
 ISOTOPE_SPACING = Decimal("1.003355")
+
+
+def _exact_precision(
+    numbers: Iterable[Decimal], multipliers: Iterable[int] = ()
+) -> int:
+    """Decimal context precision keeping every operation here exact.
+
+    The default :class:`decimal.Decimal` context rounds to 28 *significant*
+    digits.  That silently erased a 1e-30 discrepancy between a ~1 m/z peak
+    pair and the isotope spacing (the subtraction result needed 32 digits),
+    so a zero-tolerance pair that should have been rejected looked exact.
+
+    Decimal comparisons never round; only arithmetic does.  For a subtraction
+    of finite decimals the exact result spans from the most significant digit
+    position of the largest operand to the most negative exponent of either
+    operand, and multiplication by a ``d``-digit integer adds at most ``d``
+    digits, so the precision derived here is a safe exact bound.
+    """
+    most_significant = 0
+    decimal_places = 0
+    for value in numbers:
+        if not value.is_finite():
+            continue
+        digits = value.as_tuple().digits
+        exponent = value.as_tuple().exponent
+        decimal_places = max(decimal_places, -exponent)
+        if any(digits):
+            adjusted = exponent + len(digits) - 1
+            most_significant = max(most_significant, adjusted)
+    multiplier_digits = 0
+    for multiplier in multipliers:
+        multiplier_digits = max(multiplier_digits, len(str(abs(multiplier))))
+    return most_significant + decimal_places + multiplier_digits + 2
+
+
+@contextmanager
+def exact_decimal_context(
+    numbers: Iterable[Decimal], multipliers: Iterable[int] = ()
+):
+    """Arithmetic context in which every operation on ``numbers`` is exact."""
+    precision = _exact_precision(numbers, multipliers)
+    with localcontext() as context:
+        context.prec = max(context.prec, precision)
+        yield
 
 MIN_CLUSTER_SIZE = 2
 MAX_CLUSTER_SIZE = 6
@@ -58,17 +103,20 @@ def generate_clusters_for_charge(
     is equivalent to ``|Δmz − 1.003355/z| ≤ tol`` but needs no division.
     """
     n = len(mzs)
-    threshold = tolerance * charge
     # adjacency[i] = peaks j > i whose spacing from i matches 1.003355/z.
     adjacency: list[list[int]] = [[] for _ in range(n)]
-    for i in range(n):
-        for j in range(i + 1, n):
-            delta = mzs[j] - mzs[i]
-            deviation = delta * charge - ISOTOPE_SPACING
-            if deviation > threshold:
-                break  # m/z strictly increasing: later j deviate even more
-            if deviation >= -threshold:
-                adjacency[i].append(j)
+    with exact_decimal_context(
+        [*mzs, ISOTOPE_SPACING, tolerance], [charge]
+    ):
+        threshold = tolerance * charge
+        for i in range(n):
+            for j in range(i + 1, n):
+                delta = mzs[j] - mzs[i]
+                deviation = delta * charge - ISOTOPE_SPACING
+                if deviation > threshold:
+                    break  # m/z strictly increasing: later j deviate even more
+                if deviation >= -threshold:
+                    adjacency[i].append(j)
     # A cluster is a chain i1 < i2 < ... < ik (2 <= k <= 6) of
     # adjacent matches; extend chains depth-first.
     found: list[Cluster] = []
@@ -389,6 +437,7 @@ class CoelutingSolver:
         self._max_search_ops = max_search_ops
         self._search_ops = 0
         self._required = required  # ascending distinct positive ints
+        self._context_numbers = [*(p.mz for p in peaks), mass_tolerance]
         mzs = [p.mz for p in peaks]
         intensities = [p.intensity for p in peaks]
         options: list[list[Cluster]] = []
@@ -398,6 +447,15 @@ class CoelutingSolver:
             bucket.sort(key=lambda c: (c.peak_indices[0], c.peak_indices))
             options.append(bucket)
         self._options = options
+
+    def _exact_context(self) -> Any:
+        """Fresh exact context for neutral-mass arithmetic (charge * m/z).
+
+        That arithmetic must be just as exact as the spacing test (see
+        :func:`exact_decimal_context`); a new manager is returned each time
+        because context managers are not re-enterable.
+        """
+        return exact_decimal_context(self._context_numbers, self._required)
 
     def _tick(self) -> None:
         self._search_ops += 1
@@ -513,16 +571,17 @@ class CoelutingSolver:
     def solve(self) -> CoelutingResult:
         total_intensity = sum(self._intensities)
         best: list[tuple[int, int]] = [(-1, -1)]
-        self._find_best(
-            0,
-            0,
-            Decimal("-Infinity"),
-            Decimal("Infinity"),
-            0,
-            0,
-            total_intensity,
-            best,
-        )
+        with self._exact_context():
+            self._find_best(
+                0,
+                0,
+                Decimal("-Infinity"),
+                Decimal("Infinity"),
+                0,
+                0,
+                total_intensity,
+                best,
+            )
         if best[0][0] < 0:
             return CoelutingResult(
                 verdict=VERDICT_UNRESOLVED,
@@ -536,38 +595,39 @@ class CoelutingSolver:
             )
 
         found: list[Candidate] = []
-        self._collect(
-            0,
-            0,
-            Decimal("-Infinity"),
-            Decimal("Infinity"),
-            0,
-            0,
-            total_intensity,
-            best[0],
-            [],
-            found,
-            limit=2,
-        )
-        canonical = {
-            tuple(sorted(cand, key=lambda c: c.canonical_key())) for cand in found
-        }
-        ordered = sorted(
-            canonical,
-            key=lambda cand: tuple((c.peak_indices, c.charge) for c in cand),
-        )
-        primary = ordered[0]
-        secondary = ordered[1] if len(ordered) > 1 else None
-        primary_obj = candidate_objective(primary)
+        with self._exact_context():
+            self._collect(
+                0,
+                0,
+                Decimal("-Infinity"),
+                Decimal("Infinity"),
+                0,
+                0,
+                total_intensity,
+                best[0],
+                [],
+                found,
+                limit=2,
+            )
+            canonical = {
+                tuple(sorted(cand, key=lambda c: c.canonical_key())) for cand in found
+            }
+            ordered = sorted(
+                canonical,
+                key=lambda cand: tuple((c.peak_indices, c.charge) for c in cand),
+            )
+            primary = ordered[0]
+            secondary = ordered[1] if len(ordered) > 1 else None
+            primary_obj = candidate_objective(primary)
 
-        lower = max(
-            c.charge * self._peaks[c.peak_indices[0]].mz - self._mass_tolerance
-            for c in primary
-        )
-        upper = min(
-            c.charge * self._peaks[c.peak_indices[0]].mz + self._mass_tolerance
-            for c in primary
-        )
+            lower = max(
+                c.charge * self._peaks[c.peak_indices[0]].mz - self._mass_tolerance
+                for c in primary
+            )
+            upper = min(
+                c.charge * self._peaks[c.peak_indices[0]].mz + self._mass_tolerance
+                for c in primary
+            )
         return CoelutingResult(
             verdict=VERDICT_UNIQUE if secondary is None else VERDICT_AMBIGUOUS,
             explained_intensity=primary_obj[0],

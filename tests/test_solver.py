@@ -191,3 +191,17 @@ def test_search_budget_guard():
     spec = [(str(Decimal("500.000000") + i * S), 1) for i in range(12)]
     with pytest.raises(SearchSpaceExceededError):
         Deconvolver(make_peaks(spec), [1], Decimal("0.0001"), max_search_ops=1).solve()
+
+
+def test_zero_tolerance_keeps_sub_context_precision_discrepancies():
+    # A 1e-30 spacing excess over 1.003355 must not be rounded away (the
+    # default Decimal context only carries 28 significant digits).
+    spec = [
+        ("0.000000000000000000000000000001", 10),
+        ("1.003355000000000000000000000002", 10),
+    ]
+    assert solve(spec, [1], "0").verdict == VERDICT_UNRESOLVED
+    # A tolerance matching the discrepancy exactly accepts the pair.
+    result = solve(spec, [1], "0.000000000000000000000000000001")
+    assert result.verdict == VERDICT_UNIQUE
+    assert result.primary[0].peak_indices == (0, 1)

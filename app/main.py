@@ -34,6 +34,7 @@ from .solver import (
     Deconvolver,
     Peak,
     SearchSpaceExceededError,
+    exact_decimal_context,
 )
 
 # Safety valve for pathological search spaces (see app.solver).  The search
@@ -206,19 +207,28 @@ def _build_coeluting_response(
     peaks: list[Peak],
     result: CoelutingResult,
 ) -> CoelutingResponse:
-    primary = _coeluting_solution_out(
-        result.primary, peaks, payload.mass_tolerance
-    )
-    secondary = (
-        _coeluting_solution_out(result.secondary, peaks, payload.mass_tolerance)
-        if result.secondary is not None
-        else None
-    )
-    common_mass = (
-        MassIntervalOut(lower=str(result.mass_lower), upper=str(result.mass_upper))
-        if result.primary
-        else None
-    )
+    # Neutral-mass multiplication (charge * first-peak m/z) is exact for
+    # submitted decimals, so render it under the same exact context the solver
+    # used rather than the default 28-digit rounding context.
+    charges = {c.charge for c in result.primary}
+    if result.secondary is not None:
+        charges.update(c.charge for c in result.secondary)
+    with exact_decimal_context(
+        [*(p.mz for p in peaks), payload.mass_tolerance], charges
+    ):
+        primary = _coeluting_solution_out(
+            result.primary, peaks, payload.mass_tolerance
+        )
+        secondary = (
+            _coeluting_solution_out(result.secondary, peaks, payload.mass_tolerance)
+            if result.secondary is not None
+            else None
+        )
+        common_mass = (
+            MassIntervalOut(lower=str(result.mass_lower), upper=str(result.mass_upper))
+            if result.primary
+            else None
+        )
     return CoelutingResponse(
         verdict=result.verdict,
         objectives=ObjectivesOut(

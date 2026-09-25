@@ -208,3 +208,51 @@ def test_invalid_construction_arguments():
         CoelutingSolver(peaks, [1, 2], [1, 2], Decimal("0.1"), Decimal("-1"))
     with pytest.raises(ValueError):
         CoelutingSolver(peaks, [1, 2], [1, 2], Decimal("-0.1"), Decimal("1"))
+
+
+def test_high_precision_zero_tolerance_does_not_accept_mismatched_pair():
+    # The z=2 pair (peaks 0,2) is spaced at exactly 1.003355/2, but each
+    # would-be z=1 pair differs from 1.003355 by 1e-30 -- a difference the
+    # default 28-digit Decimal context would silently round away.  With both
+    # tolerances at zero there is no complete joint candidate.
+    spec = [
+        ("0.0000000000000000000000000000005", 10),
+        ("0.000000000000000000000000000001", 10),
+        ("0.5016775000000000000000000000005", 10),
+        ("1.003355000000000000000000000002", 10),
+    ]
+    result = solve(spec, [1, 2], "0", "0")
+    assert result.verdict == VERDICT_UNRESOLVED
+    assert result.primary == ()
+    assert result.secondary is None
+    assert (result.explained_intensity, result.explained_peak_count, result.cluster_count) == (0, 0, 0)
+    # The exact charge-2 pair is still a legal cluster; the rejection is
+    # specifically about the over-broad charge-1 matching.
+    from app.solver import generate_clusters_for_charge
+
+    mzs = [Decimal(mz) for mz, _ in spec]
+    its = [it for _, it in spec]
+    z1 = generate_clusters_for_charge(1, mzs, its, Decimal("0"))
+    z2 = generate_clusters_for_charge(2, mzs, its, Decimal("0"))
+    assert z1 == []
+    assert [c.peak_indices for c in z2] == [(0, 2)]
+
+
+def test_high_precision_legal_pair_is_accepted_with_matching_tolerance():
+    # Same construction, but a tolerance of exactly 1e-30 admits the z=1
+    # pair (peaks 1,3); the first-peak neutral masses of the z=1 and z=2
+    # pairs coincide exactly (1e-30 = 2 * 5e-31), so zero mass tolerance
+    # still admits the joint candidate.
+    spec = [
+        ("0.0000000000000000000000000000005", 10),
+        ("0.000000000000000000000000000001", 10),
+        ("0.5016775000000000000000000000005", 10),
+        ("1.003355000000000000000000000002", 10),
+    ]
+    result = solve(spec, [1, 2], "0.000000000000000000000000000001", "0")
+    assert result.verdict == VERDICT_UNIQUE
+    by_charge = {c.charge: c.peak_indices for c in result.primary}
+    assert by_charge == {2: (0, 2), 1: (1, 3)}
+    assert result.mass_lower == result.mass_upper == Decimal(
+        "0.000000000000000000000000000001"
+    )

@@ -647,6 +647,85 @@ def scenario_coeluting_three_charges(client: httpx.Client) -> None:
     )
 
 
+def scenario_coeluting_high_precision_zero_tolerance(client: httpx.Client) -> None:
+    print("[coeluting: high-precision zero-tolerance spacing]")
+    base = {
+        "peaks": [
+            {"mz": "0.0000000000000000000000000000005", "intensity": 10},
+            {"mz": "0.000000000000000000000000000001", "intensity": 10},
+            {"mz": "0.5016775000000000000000000000005", "intensity": 10},
+            {"mz": "1.003355000000000000000000000002", "intensity": 10},
+        ],
+        "charges": [1, 2],
+        "required_charges": [1, 2],
+    }
+    # The z=2 pair (peaks 0,2) is spaced at exactly 1.003355/2; the would-be
+    # z=1 pair exceeds 1.003355 by 1e-30 (32 significant digits, beyond the
+    # default 28-digit Decimal precision).  Zero tolerance must reject it, so
+    # no complete joint candidate exists.
+    resp = post_coeluting(client, {**base, "tolerance": "0", "mass_tolerance": "0"})
+    body = resp.json() if resp.status_code == 200 else {}
+    check(
+        "hiprec: 1e-30 spacing excess at zero tolerance is UNRESOLVED",
+        resp.status_code == 200 and body.get("verdict") == "UNRESOLVED",
+        resp.text[:300],
+    )
+    check(
+        "hiprec: no clusters, witness or common mass",
+        body.get("clusters") == []
+        and body.get("second_witness") is None
+        and body.get("common_mass") is None
+        and body.get("objectives") == {
+            "explained_intensity": 0,
+            "explained_peak_count": 0,
+            "cluster_count": 0,
+        },
+        resp.text[:300],
+    )
+    # A tolerance matching the exact discrepancy makes the same peaks a
+    # legitimate joint candidate; the first-peak neutral masses coincide at
+    # 1e-30, so zero mass tolerance still suffices and the mass survives
+    # rendering without precision loss.
+    resp = post_coeluting(
+        client,
+        {**base, "tolerance": "0.000000000000000000000000000001", "mass_tolerance": "0"},
+    )
+    body = resp.json() if resp.status_code == 200 else {}
+    chosen = {
+        c.get("charge"): tuple(c.get("peak_indices")) for c in body.get("clusters", [])
+    }
+    common = body.get("common_mass") or {}
+    check(
+        "hiprec: exact 1e-30 tolerance yields the legal joint UNIQUE candidate",
+        resp.status_code == 200
+        and body.get("verdict") == "UNIQUE"
+        and chosen == {2: (0, 2), 1: (1, 3)},
+        f"{resp.text[:300]} chosen={chosen}",
+    )
+    check(
+        "hiprec: common neutral mass 1e-30 rendered exactly",
+        Decimal(common.get("lower", "NaN"))
+        == Decimal(common.get("upper", "NaN"))
+        == Decimal("0.000000000000000000000000000001"),
+        repr(common),
+    )
+    # The ordinary endpoint on the same high-precision peaks must keep the
+    # exact z=2 pair while still refusing the over-broad z=1 pair.
+    resp = post(client, {**{k: base[k] for k in ("peaks", "charges")}, "tolerance": "0"})
+    body = resp.json() if resp.status_code == 200 else {}
+    ordinary = [
+        (c.get("charge"), tuple(c.get("peak_indices")))
+        for c in body.get("clusters", [])
+    ]
+    check(
+        "hiprec: ordinary deconvolution keeps the exact z=2 cluster, rejects z=1",
+        resp.status_code == 200
+        and body.get("verdict") == "UNIQUE"
+        and ordinary == [(2, (0, 2))],
+        f"{resp.text[:300]} clusters={ordinary}",
+    )
+
+
 def scenario_coeluting_validation(client: httpx.Client) -> None:
     print("[coeluting: validation 422, never a verdict]")
     good = {
@@ -766,6 +845,7 @@ def main() -> int:
         scenario_coeluting_overlap_rejected(client)
         scenario_coeluting_ambiguous(client)
         scenario_coeluting_three_charges(client)
+        scenario_coeluting_high_precision_zero_tolerance(client)
         scenario_coeluting_validation(client)
         # Legacy endpoint regression.
         scenario_legacy_compatibility(client)

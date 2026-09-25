@@ -247,6 +247,83 @@ def test_invalid_inputs_are_422_with_located_fields():
         ), f"{name}: {locs}"
 
 
+def test_high_precision_zero_tolerance_is_unresolved():
+    # Regression: the z=1 spacing exceeds 1.003355 by 1e-30 (32 significant
+    # digits), which the default 28-digit Decimal context rounded away, so
+    # the joint verdict silently came back UNIQUE.  Zero tolerance must not
+    # accept that pair, leaving no complete joint candidate.
+    payload = {
+        "peaks": [
+            {"mz": "0.0000000000000000000000000000005", "intensity": 10},
+            {"mz": "0.000000000000000000000000000001", "intensity": 10},
+            {"mz": "0.5016775000000000000000000000005", "intensity": 10},
+            {"mz": "1.003355000000000000000000000002", "intensity": 10},
+        ],
+        "charges": [1, 2],
+        "required_charges": [1, 2],
+        "tolerance": "0",
+        "mass_tolerance": "0",
+    }
+    resp = post(payload)
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["verdict"] == "UNRESOLVED"
+    assert body["clusters"] == []
+    assert [p["index"] for p in body["unexplained_peaks"]] == [0, 1, 2, 3]
+    assert [Decimal(p["mz"]) for p in body["unexplained_peaks"]] == [
+        Decimal("0.0000000000000000000000000000005"),
+        Decimal("0.000000000000000000000000000001"),
+        Decimal("0.5016775000000000000000000000005"),
+        Decimal("1.003355000000000000000000000002"),
+    ]
+    assert all(p["intensity"] == 10 for p in body["unexplained_peaks"])
+    assert body["common_mass"] is None
+    assert body["second_witness"] is None
+    assert body["objectives"] == {
+        "explained_intensity": 0,
+        "explained_peak_count": 0,
+        "cluster_count": 0,
+    }
+
+
+def test_high_precision_matching_tolerance_is_unique():
+    # The same high-precision envelope is a valid joint candidate once the
+    # m/z tolerance covers the exact 1e-30 spacing excess.  The first-peak
+    # neutral masses coincide at 1e-30, so zero mass tolerance suffices; the
+    # rendered masses must keep their full submitted precision.
+    payload = {
+        "peaks": [
+            {"mz": "0.0000000000000000000000000000005", "intensity": 10},
+            {"mz": "0.000000000000000000000000000001", "intensity": 10},
+            {"mz": "0.5016775000000000000000000000005", "intensity": 10},
+            {"mz": "1.003355000000000000000000000002", "intensity": 10},
+        ],
+        "charges": [1, 2],
+        "required_charges": [1, 2],
+        "tolerance": "0.000000000000000000000000000001",
+        "mass_tolerance": "0",
+    }
+    resp = post(payload)
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["verdict"] == "UNIQUE"
+    assert body["objectives"] == {
+        "explained_intensity": 40,
+        "explained_peak_count": 4,
+        "cluster_count": 2,
+    }
+    by_charge = {c["charge"]: c for c in body["clusters"]}
+    assert by_charge[1]["peak_indices"] == [1, 3]
+    assert by_charge[2]["peak_indices"] == [0, 2]
+    expected_mass = Decimal("0.000000000000000000000000000001")
+    assert Decimal(by_charge[1]["neutral_mass"]) == expected_mass
+    assert Decimal(by_charge[2]["neutral_mass"]) == expected_mass
+    assert Decimal(body["common_mass"]["lower"]) == expected_mass
+    assert Decimal(body["common_mass"]["upper"]) == expected_mass
+    # The 1e-30 mass must survive rendering rather than round to 28 digits.
+    assert body["common_mass"]["upper"] != "0"
+
+
 def test_legacy_endpoint_semantics_unchanged():
     payload = {
         "peaks": [
